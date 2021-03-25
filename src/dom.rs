@@ -5,7 +5,7 @@ use bevy::{
         Parent, TextBundle, World,
     },
     text::{Font, Text, TextStyle},
-    ui::{FlexDirection, Style},
+    ui::{AlignItems, FlexDirection, Style},
 };
 
 use crate::FontHandle;
@@ -19,20 +19,14 @@ pub enum Primitive {
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct PrimitiveId(Entity);
+pub struct PrimitiveId(pub Entity);
 
 pub struct Dom<'a> {
     pub(crate) world: &'a mut World,
-    pub(crate) cursor: u32,
+    pub(crate) cursor: usize,
 }
 
 impl<'a> Dom<'a> {
-    pub fn set_cursor(&mut self, pos: u32) {
-        self.cursor = pos;
-    }
-    pub fn get_cursor(&mut self) -> u32 {
-        self.cursor
-    }
     pub fn mount_as_child(
         &mut self,
         primitive: Primitive,
@@ -43,8 +37,11 @@ impl<'a> Dom<'a> {
         helper(&mut entity, primitive, font);
         let id = entity.id();
         if let Some(pid) = parent {
-            self.world.entity_mut(pid.0).push_children(&[id]);
+            self.world
+                .entity_mut(pid.0)
+                .insert_children(self.cursor, &[id]);
         }
+        self.cursor += 1;
         PrimitiveId(id)
     }
     pub fn diff_primitive(&mut self, old: PrimitiveId, new: Primitive) {
@@ -65,6 +62,7 @@ impl<'a> Dom<'a> {
                 entity.remove_bundle::<ButtonBundle>();
             }
         }
+        self.cursor += 1;
         helper(&mut entity, new, font);
     }
     pub fn remove(&mut self, id: PrimitiveId) {
@@ -91,6 +89,7 @@ fn helper(entity: &mut EntityMut, primitive: Primitive, font: Handle<Font>) {
             entity.insert_bundle(NodeBundle {
                 style: Style {
                     flex_direction: FlexDirection::ColumnReverse,
+                    align_items: AlignItems::FlexStart,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -128,7 +127,7 @@ fn helper(entity: &mut EntityMut, primitive: Primitive, font: Handle<Font>) {
     entity.insert(kind);
 }
 
-enum PrimitiveKind {
+pub enum PrimitiveKind {
     Node,
     Text,
     Image,

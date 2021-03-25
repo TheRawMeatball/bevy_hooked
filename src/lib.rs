@@ -3,8 +3,7 @@ mod fctx;
 mod internal;
 
 use bevy::{
-    ecs::world,
-    prelude::{AppBuilder, AssetServer, Handle, HandleUntyped, IntoExclusiveSystem, Plugin, World},
+    prelude::{AppBuilder, AssetServer, Handle, IntoExclusiveSystem, Plugin, World},
     text::Font,
 };
 
@@ -20,7 +19,7 @@ pub mod prelude {
         pub use super::internal::{node, text};
     }
     pub use crate::HookedUiPlugin;
-    pub use dom::{Dom, Primitive, PrimitiveId};
+    pub use dom::{Dom, Primitive, PrimitiveId, PrimitiveKind};
 }
 
 pub struct HookedUiPlugin(pub fn() -> Element);
@@ -45,7 +44,7 @@ impl Plugin for HookedUiPlugin {
             (|world: &mut World| {
                 let mut ctx = world.remove_non_send::<Context>().unwrap();
 
-                ctx.process_messages(&mut Dom { world, cursor: 0 });
+                ctx.process_messages(world);
 
                 world.insert_non_send(ctx);
             })

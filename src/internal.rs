@@ -1,10 +1,9 @@
 use bevy::{
-    prelude::World,
+    prelude::{Entity, World},
     utils::{HashMap, HashSet},
 };
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
     hash::Hash,
     rc::Rc,
 };
@@ -26,7 +25,7 @@ pub(crate) struct EffectResolver {
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub(crate) struct MountedId(pub u64);
+pub(crate) struct MountedId(pub Entity);
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct MountedRootId(MountedId);
@@ -64,7 +63,7 @@ pub(crate) struct Component {
     f: Box<dyn DynComponentFunc>,
     props: Box<dyn Prop>,
     state: Vec<Rc<dyn Any + Send + Sync>>,
-    memos: Vec<Rc<RefCell<Memo>>>,
+    memos: Vec<Option<Rc<Memo>>>,
     effects: Vec<Effect>,
 }
 
@@ -152,7 +151,7 @@ struct Mounted {
 #[derive(Clone, Copy)]
 struct ParentPrimitiveData {
     id: PrimitiveId,
-    cursor: u32,
+    cursor: usize,
 }
 
 struct Children {
@@ -190,7 +189,7 @@ impl MountedInner {
 pub struct Context {
     tree: HashMap<MountedId, Mounted>,
     res_checks: HashMap<TypeId, (fn(&World) -> bool, Vec<MountedId>)>,
-    counter: u64,
+    cmp_checks: HashMap<MountedId, Vec<fn(&mut World, MountedId) -> bool>>,
     tx: Tx,
     rx: Rx,
 }
@@ -201,9 +200,9 @@ impl Context {
         Self {
             tree: HashMap::default(),
             res_checks: HashMap::default(),
+            cmp_checks: HashMap::default(),
             tx,
             rx,
-            counter: 0,
         }
     }
     pub fn mount_root(&mut self, e: Element, dom: &mut Dom) -> MountedRootId {
@@ -212,9 +211,9 @@ impl Context {
     pub fn unmount_root(&mut self, id: MountedRootId, dom: &mut Dom) {
         self.unmount(id.0, dom);
     }
-    pub fn process_messages(&mut self, dom: &mut Dom) {
+    pub fn process_messages(&mut self, world: &mut World) {
         for (check, vec) in self.res_checks.values() {
-            if check(&dom.world) {
+            if check(&world) {
                 for &target_component in vec {
                     self.tx
                         .send(EffectResolver {
@@ -223,6 +222,20 @@ impl Context {
                             target_state: None,
                         })
                         .unwrap();
+                }
+            }
+        }
+        'outer: for (entity, checks) in &self.cmp_checks {
+            for check in checks {
+                if check(world, *entity) {
+                    self.tx
+                        .send(EffectResolver {
+                            f: Box::new(|_| ()),
+                            target_component: *entity,
+                            target_state: None,
+                        })
+                        .unwrap();
+                    continue 'outer;
                 }
             }
         }
@@ -274,11 +287,12 @@ impl Context {
                     parent,
                 } = self.tree.remove(&rerender_root).unwrap();
                 let c = inner.as_component().unwrap();
+                let mut dom = Dom { world, cursor: 0 };
                 if let Some(data) = &parent {
-                    dom.set_cursor(data.cursor);
-                    c.update(rerender_root, &mut children, self, dom, Some(data.id));
+                    dom.cursor = data.cursor;
+                    c.update(rerender_root, &mut children, self, &mut dom, Some(data.id));
                 } else {
-                    c.update(rerender_root, &mut children, self, dom, None);
+                    c.update(rerender_root, &mut children, self, &mut dom, None);
                 };
                 self.tree.insert(
                     rerender_root,
@@ -305,24 +319,26 @@ impl Context {
         match element {
             ElementInner::Primitive(p, c) => {
                 let id = dom.mount_as_child(p, parent.map(|v| v.id));
-                let old_cursor = dom.get_cursor();
-                dom.set_cursor(0);
                 let mut keyed = HashMap::default();
                 let mut unkeyed = Vec::new();
-                for element in c.into_iter() {
-                    let data = ParentPrimitiveData {
-                        id,
-                        cursor: dom.get_cursor(),
+                {
+                    let mut dom = Dom {
+                        world: dom.world,
+                        cursor: 0,
                     };
-                    if let Some(key) = element.1 {
-                        keyed.insert(key, self.mount(element.0, dom, Some(data)));
-                    } else {
-                        unkeyed.push(self.mount(element.0, dom, Some(data)));
+                    for element in c.into_iter() {
+                        let data = ParentPrimitiveData {
+                            id,
+                            cursor: dom.cursor,
+                        };
+                        if let Some(key) = element.1 {
+                            keyed.insert(key, self.mount(element.0, &mut dom, Some(data)));
+                        } else {
+                            unkeyed.push(self.mount(element.0, &mut dom, Some(data)));
+                        }
                     }
                 }
-                dom.set_cursor(old_cursor);
-                let mounted_id = MountedId(self.counter);
-                self.counter += 1;
+                let mounted_id = MountedId(dom.world.spawn().id());
                 self.tree.insert(
                     mounted_id,
                     Mounted {
@@ -330,7 +346,7 @@ impl Context {
                         children: Children { keyed, unkeyed },
                         parent: parent.map(|data| ParentPrimitiveData {
                             id: data.id,
-                            cursor: dom.get_cursor(),
+                            cursor: dom.cursor,
                         }),
                     },
                 );
@@ -340,8 +356,7 @@ impl Context {
                 let mut state = Vec::new();
                 let mut memos = Vec::new();
                 let mut effects = Vec::new();
-                let mounted_id = MountedId(self.counter);
-                self.counter += 1;
+                let mounted_id = MountedId(dom.world.spawn().id());
                 let children = c.f.call(
                     &*c.props,
                     Fctx::render_first(
@@ -351,6 +366,7 @@ impl Context {
                         &mut memos,
                         &mut effects,
                         &mut self.res_checks,
+                        &mut self.cmp_checks,
                         dom.world,
                     ),
                 );
@@ -359,7 +375,7 @@ impl Context {
                 for element in children.into_iter() {
                     let data = parent.map(|data| ParentPrimitiveData {
                         id: data.id,
-                        cursor: dom.get_cursor(),
+                        cursor: dom.cursor,
                     });
                     let mount_id = self.mount(element.0, dom, data);
                     if let Some(key) = element.1 {
@@ -416,6 +432,8 @@ impl Context {
                         _ => {}
                     }
                 }
+                dom.world.despawn(this.0);
+                self.cmp_checks.remove(&this);
             }
         }
     }
@@ -429,15 +447,18 @@ impl Context {
         match (inner, other.0) {
             (MountedInner::Primitive(p_id), ElementInner::Primitive(new, new_children)) => {
                 dom.diff_primitive(p_id, new);
-                let old_cursor = dom.get_cursor();
-                dom.set_cursor(0);
-                self.diff_children(
-                    &mut children,
-                    ComponentOutput::Multiple(new_children),
-                    dom,
-                    Some(p_id),
-                );
-                dom.set_cursor(old_cursor);
+                {
+                    let mut dom = Dom {
+                        world: dom.world,
+                        cursor: 0,
+                    };
+                    self.diff_children(
+                        &mut children,
+                        ComponentOutput::Multiple(new_children),
+                        &mut dom,
+                        Some(p_id),
+                    );
+                }
                 self.tree.insert(
                     *id,
                     Mounted {
@@ -503,7 +524,7 @@ impl Context {
         for element in new {
             let data = parent.map(|id| ParentPrimitiveData {
                 id,
-                cursor: dom.get_cursor(),
+                cursor: dom.cursor,
             });
             if let Some(key) = element.1 {
                 if let Some(mut old_id) = old.keyed.remove(&key) {

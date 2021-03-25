@@ -6,7 +6,7 @@ use std::{
     rc::Rc,
 };
 
-use bevy::{ecs::component::Component, prelude::World, utils::HashMap};
+use bevy::{ecs::component::Component, prelude::*, utils::HashMap};
 
 use crate::internal::{Effect, EffectResolver, EffectStage, MountedId, Tx};
 
@@ -14,14 +14,16 @@ pub struct Fctx<'a> {
     tx: Tx,
     id: MountedId,
     states: RefCell<&'a mut Vec<Rc<dyn Any + Send + Sync>>>,
-    memos: RefCell<&'a mut Vec<Rc<RefCell<Memo>>>>,
+    memos: RefCell<&'a mut Vec<Option<Rc<Memo>>>>,
     effects: RefCell<&'a mut Vec<Effect>>,
     states_selector: Cell<usize>,
     effects_selector: Cell<usize>,
     memos_selector: Cell<usize>,
     res_checks: Option<RefCell<&'a mut HashMap<TypeId, (fn(&World) -> bool, Vec<MountedId>)>>>,
+    cmp_checks: Option<RefCell<&'a mut HashMap<MountedId, Vec<fn(&mut World, MountedId) -> bool>>>>,
     init: bool,
-    world: &'a World,
+    world: &'a mut World,
+    nonsend_queue: RefCell<Vec<Box<dyn FnOnce(&mut World)>>>,
 }
 
 impl<'a> Fctx<'a> {
@@ -30,10 +32,11 @@ impl<'a> Fctx<'a> {
         tx: Tx,
         id: MountedId,
         states: &'a mut Vec<Rc<dyn Any + Send + Sync>>,
-        memos: &'a mut Vec<Rc<RefCell<Memo>>>,
+        memos: &'a mut Vec<Option<Rc<Memo>>>,
         effects: &'a mut Vec<Effect>,
         res_checks: &'a mut HashMap<TypeId, (fn(&World) -> bool, Vec<MountedId>)>,
-        world: &'a World,
+        cmp_checks: &'a mut HashMap<MountedId, Vec<fn(&mut World, MountedId) -> bool>>,
+        world: &'a mut World,
     ) -> Self {
         Self {
             tx,
@@ -45,8 +48,10 @@ impl<'a> Fctx<'a> {
             effects_selector: Cell::new(0),
             memos_selector: Cell::new(0),
             res_checks: Some(RefCell::new(res_checks)),
+            cmp_checks: Some(RefCell::new(cmp_checks)),
             init: true,
             world,
+            nonsend_queue: RefCell::default(),
         }
     }
 
@@ -54,9 +59,9 @@ impl<'a> Fctx<'a> {
         tx: Tx,
         id: MountedId,
         states: &'a mut Vec<Rc<dyn Any + Send + Sync>>,
-        memos: &'a mut Vec<Rc<RefCell<Memo>>>,
+        memos: &'a mut Vec<Option<Rc<Memo>>>,
         effects: &'a mut Vec<Effect>,
-        world: &'a World,
+        world: &'a mut World,
     ) -> Self {
         Self {
             tx,
@@ -69,7 +74,9 @@ impl<'a> Fctx<'a> {
             memos_selector: Cell::new(0),
             init: false,
             res_checks: None,
+            cmp_checks: None,
             world,
+            nonsend_queue: RefCell::default(),
         }
     }
 
@@ -82,11 +89,11 @@ impl<'a> Fctx<'a> {
         let state = if self.init {
             let rc = Rc::new(default());
             self.states.borrow_mut().push(rc.clone());
-            Ref::new(rc)
+            Ref::Rc(rc)
         } else {
             let states = self.states.borrow();
             let state = states.get(self.states_selector.get()).unwrap();
-            Ref::new(state.clone())
+            Ref::Rc(Rc::downcast(state.clone()).unwrap())
         };
         self.states_selector.set(self.states_selector.get() + 1);
         (
@@ -147,33 +154,28 @@ impl<'a> Fctx<'a> {
     {
         let mut memos = self.memos.borrow_mut();
         let memo = if self.init {
-            let rc = Rc::new(RefCell::new(Memo {
+            let rc = Rc::new(Memo {
                 eq_cache: Box::new(eq_cache),
                 val: Rc::new(f()),
-            }));
-            memos.push(rc.clone());
+            });
+            memos.push(Some(rc.clone()));
             rc
         } else {
-            let state = memos.get(self.memos_selector.get()).unwrap();
-            if memos
-                .get(self.memos_selector.get())
-                .and_then(|v| {
-                    v.borrow()
-                        .eq_cache
-                        .as_ref()
-                        .downcast_ref::<X>()
-                        .map(|v| v != &eq_cache)
-                })
+            let mut state = memos
+                .get_mut(self.memos_selector.get())
                 .unwrap()
-            {
-                let mut memo = state.borrow_mut();
+                .take()
+                .unwrap();
+            if state.eq_cache.downcast_ref::<X>().unwrap() != &eq_cache {
+                let mut memo: &mut Memo = Rc::get_mut(&mut state).unwrap();
                 memo.val = Rc::new(f());
                 memo.eq_cache = Box::new(eq_cache);
             }
-            state.borrow().val.clone()
+            *memos.get_mut(self.memos_selector.get()).unwrap() = Some(state.clone());
+            state.clone()
         };
         self.memos_selector.set(self.memos_selector.get() + 1);
-        Ref::new(memo)
+        Ref::Rc(Rc::downcast(memo.val.clone()).unwrap())
     }
 
     pub fn use_resource<T: Component>(&self) -> &T {
@@ -186,27 +188,68 @@ impl<'a> Fctx<'a> {
         }
         self.world.get_resource().unwrap()
     }
+
+    pub fn use_linked_state<T: Component, F: FnOnce() -> T>(&self, f: F) -> Ref<'_, T> {
+        if self.init {
+            let rc = Rc::new(f());
+            let entity = self.id.0;
+            let rc_clone = rc.clone();
+            self.nonsend_queue.borrow_mut().push(Box::new(move |world| {
+                world
+                    .entity_mut(entity)
+                    .insert(Rc::try_unwrap(rc_clone).ok().unwrap());
+            }));
+            self.cmp_checks
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .entry(self.id)
+                .or_default()
+                .push(|world, e| world.entity_mut(e.0).get_mut::<T>().unwrap().is_changed());
+            Ref::new(rc)
+        } else {
+            let val = self.world.entity(self.id.0).get::<T>().unwrap();
+            Ref::Borrowed(val)
+        }
+    }
+
+    pub fn use_broadcast_state<T: Component>(&self, v: T) {
+        let entity = self.id.0;
+        self.nonsend_queue.borrow_mut().push(Box::new(move |world| {
+            world.entity_mut(entity).insert(v);
+        }));
+    }
+
+    pub fn use_disconnected_state<T: Component, F: FnOnce() -> T>(&self, f: F) {
+        if self.init {
+            let v = f();
+            let entity = self.id.0;
+            self.nonsend_queue.borrow_mut().push(Box::new(move |world| {
+                world.entity_mut(entity).insert(v);
+            }));
+        }
+    }
 }
 
-pub struct Ref<'a, T> {
-    inner: Rc<dyn Any>,
-    _lt: PhantomData<&'a T>,
+pub enum Ref<'a, T> {
+    Rc(Rc<T>),
+    Borrowed(&'a T),
 }
 
 impl<'a, T: 'static> Deref for Ref<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        (&*self.inner).downcast_ref().unwrap()
+        match self {
+            Ref::Rc(v) => v,
+            Ref::Borrowed(v) => *v,
+        }
     }
 }
 
 impl<'a, T> Ref<'a, T> {
-    fn new(inner: Rc<dyn Any>) -> Self {
-        Self {
-            inner,
-            _lt: PhantomData,
-        }
+    fn new(inner: Rc<T>) -> Self {
+        Self::Rc(inner)
     }
 }
 
@@ -233,5 +276,13 @@ impl<T: 'static> Setter<T> {
                 target_state: Some(state as u64),
             })
             .unwrap();
+    }
+}
+
+impl<'a> Drop for Fctx<'a> {
+    fn drop(&mut self) {
+        for nonsend in self.nonsend_queue.get_mut().drain(..) {
+            nonsend(self.world);
+        }
     }
 }
