@@ -3,7 +3,7 @@ use std::{
     cell::{Cell, RefCell},
     marker::PhantomData,
     ops::Deref,
-    rc::Rc,
+    sync::Arc,
 };
 
 use bevy::{ecs::component::Component, prelude::*, utils::HashMap};
@@ -13,8 +13,8 @@ use crate::internal::{Effect, EffectResolver, EffectStage, MountedId, Tx};
 pub struct Fctx<'a> {
     tx: Tx,
     id: MountedId,
-    states: RefCell<&'a mut Vec<Rc<dyn Any + Send + Sync>>>,
-    memos: RefCell<&'a mut Vec<Option<Rc<Memo>>>>,
+    states: RefCell<&'a mut Vec<Arc<dyn Any + Send + Sync>>>,
+    memos: RefCell<&'a mut Vec<Option<Arc<Memo>>>>,
     effects: RefCell<&'a mut Vec<Effect>>,
     states_selector: Cell<usize>,
     effects_selector: Cell<usize>,
@@ -31,8 +31,8 @@ impl<'a> Fctx<'a> {
     pub(crate) fn render_first(
         tx: Tx,
         id: MountedId,
-        states: &'a mut Vec<Rc<dyn Any + Send + Sync>>,
-        memos: &'a mut Vec<Option<Rc<Memo>>>,
+        states: &'a mut Vec<Arc<dyn Any + Send + Sync>>,
+        memos: &'a mut Vec<Option<Arc<Memo>>>,
         effects: &'a mut Vec<Effect>,
         res_checks: &'a mut HashMap<TypeId, (fn(&World) -> bool, Vec<MountedId>)>,
         cmp_checks: &'a mut HashMap<MountedId, Vec<fn(&mut World, MountedId) -> bool>>,
@@ -58,8 +58,8 @@ impl<'a> Fctx<'a> {
     pub(crate) fn update(
         tx: Tx,
         id: MountedId,
-        states: &'a mut Vec<Rc<dyn Any + Send + Sync>>,
-        memos: &'a mut Vec<Option<Rc<Memo>>>,
+        states: &'a mut Vec<Arc<dyn Any + Send + Sync>>,
+        memos: &'a mut Vec<Option<Arc<Memo>>>,
         effects: &'a mut Vec<Effect>,
         world: &'a mut World,
     ) -> Self {
@@ -87,13 +87,13 @@ impl<'a> Fctx<'a> {
         default: F,
     ) -> (Ref<'f, T>, Setter<T>) {
         let state = if self.init {
-            let rc = Rc::new(default());
+            let rc = Arc::new(default());
             self.states.borrow_mut().push(rc.clone());
             Ref::Rc(rc)
         } else {
             let states = self.states.borrow();
             let state = states.get(self.states_selector.get()).unwrap();
-            Ref::Rc(Rc::downcast(state.clone()).unwrap())
+            Ref::Rc(Arc::downcast(state.clone()).unwrap())
         };
         self.states_selector.set(self.states_selector.get() + 1);
         (
@@ -111,12 +111,12 @@ impl<'a> Fctx<'a> {
     where
         F: FnOnce() -> D + Send + Sync + 'static,
         D: FnOnce() + Send + Sync + 'static,
-        X: PartialEq + 'static,
+        X: Send + Sync + PartialEq + 'static,
     {
         let mut effects = self.effects.borrow_mut();
         if self.init {
             effects.push(Effect {
-                eq_cache: eq_cache.map(|x| Box::new(x) as Box<dyn Any>),
+                eq_cache: eq_cache.map(|x| Box::new(x) as Box<dyn Any + Send + Sync>),
                 f: EffectStage::Effect(Box::new(move || Box::new(f()))),
             });
         } else {
@@ -137,7 +137,7 @@ impl<'a> Fctx<'a> {
                         }
                     }
                     Effect {
-                        eq_cache: eq_cache.map(|x| Box::new(x) as Box<dyn Any>),
+                        eq_cache: eq_cache.map(|x| Box::new(x) as Box<dyn Any + Send + Sync>),
                         f: EffectStage::Effect(Box::new(move || Box::new(f()))),
                     }
                 });
@@ -146,17 +146,21 @@ impl<'a> Fctx<'a> {
         }
     }
 
-    pub fn use_memo<'f, X, T, F>(&'f self, eq_cache: X, f: F) -> Ref<'f, T>
+    pub fn use_memo<'f, X: Send + Sync, T: Send + Sync, F>(
+        &'f self,
+        eq_cache: X,
+        f: F,
+    ) -> Ref<'f, T>
     where
         T: 'static,
-        X: PartialEq + 'static,
+        X: Send + Sync + PartialEq + 'static,
         F: Fn() -> T,
     {
         let mut memos = self.memos.borrow_mut();
         let memo = if self.init {
-            let rc = Rc::new(Memo {
+            let rc = Arc::new(Memo {
                 eq_cache: Box::new(eq_cache),
-                val: Rc::new(f()),
+                val: Arc::new(f()),
             });
             memos.push(Some(rc.clone()));
             rc
@@ -167,15 +171,15 @@ impl<'a> Fctx<'a> {
                 .take()
                 .unwrap();
             if state.eq_cache.downcast_ref::<X>().unwrap() != &eq_cache {
-                let mut memo: &mut Memo = Rc::get_mut(&mut state).unwrap();
-                memo.val = Rc::new(f());
+                let mut memo: &mut Memo = Arc::get_mut(&mut state).unwrap();
+                memo.val = Arc::new(f());
                 memo.eq_cache = Box::new(eq_cache);
             }
             *memos.get_mut(self.memos_selector.get()).unwrap() = Some(state.clone());
             state.clone()
         };
         self.memos_selector.set(self.memos_selector.get() + 1);
-        Ref::Rc(Rc::downcast(memo.val.clone()).unwrap())
+        Ref::Rc(Arc::downcast(memo.val.clone()).unwrap())
     }
 
     pub fn use_resource<T: Component>(&self) -> &T {
@@ -189,15 +193,22 @@ impl<'a> Fctx<'a> {
         self.world.get_resource().unwrap()
     }
 
+    pub fn use_resource_setter<T: Component>(&self) -> ResSetter<T> {
+        ResSetter {
+            tx: self.tx.clone(),
+            _m: PhantomData,
+        }
+    }
+
     pub fn use_linked_state<T: Component, F: FnOnce() -> T>(&self, f: F) -> Ref<'_, T> {
         if self.init {
-            let rc = Rc::new(f());
+            let rc = Arc::new(f());
             let entity = self.id.0;
             let rc_clone = rc.clone();
             self.nonsend_queue.borrow_mut().push(Box::new(move |world| {
                 world
                     .entity_mut(entity)
-                    .insert(Rc::try_unwrap(rc_clone).ok().unwrap());
+                    .insert(Arc::try_unwrap(rc_clone).ok().unwrap());
             }));
             self.cmp_checks
                 .as_ref()
@@ -206,7 +217,7 @@ impl<'a> Fctx<'a> {
                 .entry(self.id)
                 .or_default()
                 .push(|world, e| world.entity_mut(e.0).get_mut::<T>().unwrap().is_changed());
-            Ref::new(rc)
+            Ref::Rc(rc)
         } else {
             let val = self.world.entity(self.id.0).get::<T>().unwrap();
             Ref::Borrowed(val)
@@ -232,7 +243,7 @@ impl<'a> Fctx<'a> {
 }
 
 pub enum Ref<'a, T> {
-    Rc(Rc<T>),
+    Rc(Arc<T>),
     Borrowed(&'a T),
 }
 
@@ -247,15 +258,9 @@ impl<'a, T: 'static> Deref for Ref<'a, T> {
     }
 }
 
-impl<'a, T> Ref<'a, T> {
-    fn new(inner: Rc<T>) -> Self {
-        Self::Rc(inner)
-    }
-}
-
 pub(crate) struct Memo {
-    eq_cache: Box<dyn Any>,
-    val: Rc<dyn Any>,
+    eq_cache: Box<dyn Any + Send + Sync>,
+    val: Arc<dyn Any + Send + Sync>,
 }
 
 pub struct Setter<T> {
@@ -265,15 +270,30 @@ pub struct Setter<T> {
     _m: PhantomData<fn() -> T>,
 }
 
+pub struct ResSetter<T: Component> {
+    tx: Tx,
+    _m: PhantomData<fn() -> T>,
+}
+
+impl<T: Component> ResSetter<T> {
+    pub fn set<F: FnOnce(Mut<T>) + 'static>(&self, f: F) {
+        self.tx
+            .send(EffectResolver::WorldAccess(Box::new(|w| {
+                f(w.get_resource_mut().unwrap())
+            })))
+            .unwrap();
+    }
+}
+
 impl<T: 'static> Setter<T> {
-    pub fn set<F: FnOnce(&mut T) + Send + Sync + 'static>(&self, f: F) {
+    pub fn set<F: FnOnce(&mut T, &mut World) + Send + Sync + 'static>(&self, f: F) {
         let id = self.target;
         let state = self.state;
         self.tx
-            .send(EffectResolver {
-                f: Box::new(|c| f(c.downcast_mut().unwrap())),
+            .send(EffectResolver::Effect {
+                f: Box::new(|c, w| f(c.downcast_mut().unwrap(), w)),
                 target_component: id,
-                target_state: Some(state as u64),
+                target_state: state,
             })
             .unwrap();
     }

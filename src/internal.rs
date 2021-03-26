@@ -5,7 +5,7 @@ use bevy::{
 use std::{
     any::{Any, TypeId},
     hash::Hash,
-    rc::Rc,
+    sync::Arc,
 };
 
 use crossbeam_channel::{Receiver, Sender};
@@ -18,10 +18,39 @@ use crate::fctx::Fctx;
 pub(crate) type Tx = Sender<EffectResolver>;
 pub(crate) type Rx = Receiver<EffectResolver>;
 
-pub(crate) struct EffectResolver {
-    pub(crate) f: Box<dyn FnOnce(&mut dyn Any) + Send>,
-    pub(crate) target_component: MountedId,
-    pub(crate) target_state: Option<u64>,
+pub(crate) enum EffectResolver {
+    Effect {
+        f: Box<dyn FnOnce(&mut dyn Any, &mut World) + Send>,
+        target_component: MountedId,
+        target_state: usize,
+    },
+    Flag(MountedId),
+    WorldAccess(Box<dyn FnOnce(&mut World)>),
+}
+
+impl EffectResolver {
+    fn resolve(self, world: &mut World) -> Option<MountedId> {
+        match self {
+            EffectResolver::Effect {
+                f,
+                target_component,
+                target_state,
+            } => {
+                let mut entity = world.entity_mut(target_component.0);
+                let mut mounted = entity.remove::<Mounted>().unwrap();
+                let component = mounted.inner.as_component().unwrap();
+                let rc = &mut component.state[target_state];
+                let state = Arc::get_mut(rc).unwrap();
+                f(state, world);
+                Some(target_component)
+            }
+            EffectResolver::Flag(id) => Some(id),
+            EffectResolver::WorldAccess(f) => {
+                f(world);
+                None
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -50,25 +79,22 @@ trait DynComponentFunc: Send + Sync {
 }
 
 pub(crate) struct Effect {
-    pub(crate) eq_cache: Option<Box<dyn Any>>,
+    pub(crate) eq_cache: Option<Box<dyn Any + Send + Sync>>,
     pub(crate) f: EffectStage,
 }
 
 pub(crate) enum EffectStage {
-    Effect(Box<dyn FnOnce() -> Box<dyn FnOnce()>>),
-    Destructor(Box<dyn FnOnce()>),
+    Effect(Box<dyn FnOnce() -> Box<dyn FnOnce() + Send + Sync> + Send + Sync>),
+    Destructor(Box<dyn FnOnce() + Send + Sync>),
 }
 
 pub(crate) struct Component {
     f: Box<dyn DynComponentFunc>,
     props: Box<dyn Prop>,
-    state: Vec<Rc<dyn Any + Send + Sync>>,
-    memos: Vec<Option<Rc<Memo>>>,
+    state: Vec<Arc<dyn Any + Send + Sync>>,
+    memos: Vec<Option<Arc<Memo>>>,
     effects: Vec<Effect>,
 }
-
-// Safe: Rc cannot leak outside
-unsafe impl Send for Component {}
 
 impl Component {
     fn update(
@@ -187,7 +213,6 @@ impl MountedInner {
 }
 
 pub struct Context {
-    tree: HashMap<MountedId, Mounted>,
     res_checks: HashMap<TypeId, (fn(&World) -> bool, Vec<MountedId>)>,
     cmp_checks: HashMap<MountedId, Vec<fn(&mut World, MountedId) -> bool>>,
     tx: Tx,
@@ -198,7 +223,6 @@ impl Context {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
-            tree: HashMap::default(),
             res_checks: HashMap::default(),
             cmp_checks: HashMap::default(),
             tx,
@@ -214,27 +238,15 @@ impl Context {
     pub fn process_messages(&mut self, world: &mut World) {
         for (check, vec) in self.res_checks.values() {
             if check(&world) {
-                for &target_component in vec {
-                    self.tx
-                        .send(EffectResolver {
-                            f: Box::new(|_| ()),
-                            target_component,
-                            target_state: None,
-                        })
-                        .unwrap();
+                for &id in vec {
+                    self.tx.send(EffectResolver::Flag(id)).unwrap();
                 }
             }
         }
-        'outer: for (entity, checks) in &self.cmp_checks {
+        'outer: for (id, checks) in &self.cmp_checks {
             for check in checks {
-                if check(world, *entity) {
-                    self.tx
-                        .send(EffectResolver {
-                            f: Box::new(|_| ()),
-                            target_component: *entity,
-                            target_state: None,
-                        })
-                        .unwrap();
+                if check(world, *id) {
+                    self.tx.send(EffectResolver::Flag(*id)).unwrap();
                     continue 'outer;
                 }
             }
@@ -242,66 +254,49 @@ impl Context {
         let mut roots = HashSet::default();
         let mut flagged = HashSet::default();
         while !self.rx.is_empty() {
-            for resolver in self.rx.try_iter() {
-                let component = self
-                    .tree
-                    .get_mut(&resolver.target_component)
-                    .unwrap()
-                    .inner
-                    .as_component()
-                    .unwrap();
-                if let Some(ts) = resolver.target_state {
-                    let rc = &mut component.state[ts as usize];
-                    let state = Rc::get_mut(rc).unwrap();
-                    (resolver.f)(state);
-                }
-
-                let id = resolver.target_component;
-                if flagged.contains(&id) {
-                    continue;
-                }
+            for resolver in self.rx.clone().try_iter() {
+                let id = match resolver.resolve(world) {
+                    Some(id) if !flagged.contains(&id) => id,
+                    _ => continue,
+                };
 
                 fn recursive(
                     element: MountedId,
                     roots: &mut HashSet<MountedId>,
                     flagged: &mut HashSet<MountedId>,
-                    tree: &HashMap<MountedId, Mounted>,
+                    world: &World,
                 ) {
-                    for cid in &tree.get(&element).unwrap().children {
+                    for cid in &world.entity(element.0).get::<Mounted>().unwrap().children {
                         roots.remove(cid);
                         if !flagged.insert(*cid) {
                             continue;
                         }
-                        recursive(*cid, roots, flagged, tree);
+                        recursive(*cid, roots, flagged, world);
                     }
                 }
 
                 roots.insert(id);
-                recursive(id, &mut roots, &mut flagged, &self.tree);
+                recursive(id, &mut roots, &mut flagged, &world);
             }
             flagged.clear();
             for rerender_root in roots.drain() {
+                let mut entity = world.entity_mut(rerender_root.0);
+                let mut mounted = entity.remove().unwrap();
+                let entity = entity.id();
                 let Mounted {
-                    mut inner,
-                    mut children,
+                    ref mut inner,
+                    ref mut children,
                     parent,
-                } = self.tree.remove(&rerender_root).unwrap();
+                } = &mut mounted;
                 let c = inner.as_component().unwrap();
                 let mut dom = Dom { world, cursor: 0 };
                 if let Some(data) = &parent {
                     dom.cursor = data.cursor;
-                    c.update(rerender_root, &mut children, self, &mut dom, Some(data.id));
+                    c.update(rerender_root, children, self, &mut dom, Some(data.id));
                 } else {
-                    c.update(rerender_root, &mut children, self, &mut dom, None);
+                    c.update(rerender_root, children, self, &mut dom, None);
                 };
-                self.tree.insert(
-                    rerender_root,
-                    Mounted {
-                        inner,
-                        children,
-                        parent,
-                    },
-                );
+                world.entity_mut(entity).insert(mounted);
             }
         }
     }
@@ -338,30 +333,31 @@ impl Context {
                         }
                     }
                 }
-                let mounted_id = MountedId(dom.world.spawn().id());
-                self.tree.insert(
-                    mounted_id,
-                    Mounted {
-                        inner: MountedInner::Primitive(id),
-                        children: Children { keyed, unkeyed },
-                        parent: parent.map(|data| ParentPrimitiveData {
-                            id: data.id,
-                            cursor: dom.cursor,
-                        }),
-                    },
-                );
-                mounted_id
+                let cursor = dom.cursor;
+                MountedId(
+                    dom.world
+                        .spawn()
+                        .insert(Mounted {
+                            inner: MountedInner::Primitive(id),
+                            children: Children { keyed, unkeyed },
+                            parent: parent.map(|data| ParentPrimitiveData {
+                                id: data.id,
+                                cursor,
+                            }),
+                        })
+                        .id(),
+                )
             }
             ElementInner::Component(c) => {
                 let mut state = Vec::new();
                 let mut memos = Vec::new();
                 let mut effects = Vec::new();
-                let mounted_id = MountedId(dom.world.spawn().id());
+                let entity = dom.world.spawn().id();
                 let children = c.f.call(
                     &*c.props,
                     Fctx::render_first(
                         self.tx.clone(),
-                        mounted_id,
+                        MountedId(entity),
                         &mut state,
                         &mut memos,
                         &mut effects,
@@ -373,9 +369,10 @@ impl Context {
                 let mut keyed = HashMap::default();
                 let mut unkeyed = Vec::new();
                 for element in children.into_iter() {
+                    let cursor = dom.cursor;
                     let data = parent.map(|data| ParentPrimitiveData {
                         id: data.id,
-                        cursor: dom.cursor,
+                        cursor,
                     });
                     let mount_id = self.mount(element.0, dom, data);
                     if let Some(key) = element.1 {
@@ -401,23 +398,21 @@ impl Context {
                     memos,
                     effects,
                 };
-                self.tree.insert(
-                    mounted_id,
-                    Mounted {
-                        inner: MountedInner::Component(component),
-                        children: Children { keyed, unkeyed },
-                        parent,
-                    },
-                );
-                mounted_id
+                dom.world.entity_mut(entity).insert(Mounted {
+                    inner: MountedInner::Component(component),
+                    children: Children { keyed, unkeyed },
+                    parent,
+                });
+                MountedId(entity)
             }
         }
     }
 
     fn unmount(&mut self, this: MountedId, dom: &mut Dom) {
+        let mut entity = dom.world.entity_mut(this.0);
         let Mounted {
             inner, children, ..
-        } = self.tree.remove(&this).unwrap();
+        } = entity.remove().unwrap();
         for &child in &children {
             self.unmount(child, dom);
         }
@@ -439,73 +434,49 @@ impl Context {
     }
 
     fn diff(&mut self, id: &mut MountedId, other: Element, dom: &mut Dom) {
+        let mut entity = dom.world.entity_mut(id.0);
+        let mut mounted = entity.remove().unwrap();
+        let entity = entity.id();
         let Mounted {
-            inner,
-            mut children,
-            parent,
-        } = self.tree.remove(&id).unwrap();
+            ref mut inner,
+            ref mut children,
+            ref mut parent,
+        } = &mut mounted;
+        let parent = *parent;
         match (inner, other.0) {
             (MountedInner::Primitive(p_id), ElementInner::Primitive(new, new_children)) => {
-                dom.diff_primitive(p_id, new);
+                dom.diff_primitive(*p_id, new);
                 {
                     let mut dom = Dom {
                         world: dom.world,
                         cursor: 0,
                     };
                     self.diff_children(
-                        &mut children,
+                        children,
                         ComponentOutput::Multiple(new_children),
                         &mut dom,
-                        Some(p_id),
+                        Some(*p_id),
                     );
                 }
-                self.tree.insert(
-                    *id,
-                    Mounted {
-                        inner: MountedInner::Primitive(p_id),
-                        children,
-                        parent,
-                    },
-                );
+                dom.world.entity_mut(entity).insert(mounted);
             }
-            (MountedInner::Component(mut old), ElementInner::Component(new)) => {
+            (MountedInner::Component(ref mut old), ElementInner::Component(new)) => {
                 if old.f.fn_type_id() == new.f.fn_type_id() {
                     if !old.f.use_memoized(&*old.props, &*new.props) {
-                        old.update(*id, &mut children, self, dom, parent.map(|v| v.id));
+                        old.update(*id, children, self, dom, parent.map(|v| v.id));
                     }
-                    self.tree.insert(
-                        *id,
-                        Mounted {
-                            inner: MountedInner::Component(old),
-                            children,
-                            parent,
-                        },
-                    );
+                    dom.world.entity_mut(entity).insert(mounted);
                 } else {
                     for child in children.unkeyed.drain(..) {
                         self.unmount(child, dom);
                     }
-                    self.tree.insert(
-                        *id,
-                        Mounted {
-                            inner: MountedInner::Component(old),
-                            children,
-                            parent,
-                        },
-                    );
+                    dom.world.entity_mut(entity).insert(mounted);
                     self.unmount(*id, dom);
                     *id = self.mount(ElementInner::Component(new), dom, parent);
                 }
             }
-            (inner, new) => {
-                self.tree.insert(
-                    *id,
-                    Mounted {
-                        inner,
-                        children,
-                        parent,
-                    },
-                );
+            (_, new) => {
+                dom.world.entity_mut(entity).insert(mounted);
                 self.unmount(*id, dom);
                 *id = self.mount(new, dom, parent);
             }
