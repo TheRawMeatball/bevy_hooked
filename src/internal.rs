@@ -5,13 +5,11 @@ use bevy::{
 use std::{
     any::{Any, TypeId},
     hash::Hash,
-    sync::Arc,
 };
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::dom::{Dom, Primitive, PrimitiveId};
-use crate::fctx::Memo;
+use crate::dom::{Dom, PrimitiveData, PrimitiveId};
 
 use crate::fctx::Fctx;
 
@@ -19,38 +17,30 @@ pub(crate) type Tx = Sender<EffectResolver>;
 pub(crate) type Rx = Receiver<EffectResolver>;
 
 pub(crate) enum EffectResolver {
-    Effect {
-        f: Box<dyn FnOnce(&mut dyn Any, &mut World) + Send>,
-        target_component: MountedId,
-        target_state: usize,
-    },
     Flag(MountedId),
-    WorldAccess(Box<dyn FnOnce(&mut World)>),
+    ResourceAccess(TypeId, Box<dyn FnOnce(&mut World)>),
+    MountedAccess(MountedId, Box<dyn FnOnce(&mut World)>),
 }
 
 impl EffectResolver {
-    fn resolve(self, world: &mut World) -> Option<MountedId> {
+    fn resolve(self, world: &mut World) -> ResolveResult {
         match self {
-            EffectResolver::Effect {
-                f,
-                target_component,
-                target_state,
-            } => {
-                let mut entity = world.entity_mut(target_component.0);
-                let mut mounted = entity.remove::<Mounted>().unwrap();
-                let component = mounted.inner.as_component().unwrap();
-                let rc = &mut component.state[target_state];
-                let state = Arc::get_mut(rc).unwrap();
-                f(state, world);
-                Some(target_component)
-            }
-            EffectResolver::Flag(id) => Some(id),
-            EffectResolver::WorldAccess(f) => {
+            EffectResolver::Flag(id) => ResolveResult::Mounted(id),
+            EffectResolver::ResourceAccess(id, f) => {
                 f(world);
-                None
+                ResolveResult::Resource(id)
+            }
+            EffectResolver::MountedAccess(id, f) => {
+                f(world);
+                ResolveResult::Mounted(id)
             }
         }
     }
+}
+
+enum ResolveResult {
+    Mounted(MountedId),
+    Resource(TypeId),
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -77,23 +67,9 @@ trait DynComponentFunc: Send + Sync {
     fn dyn_clone(&self) -> Box<dyn DynComponentFunc>;
     fn use_memoized(&self, old: &dyn Prop, new: &dyn Prop) -> bool;
 }
-
-pub(crate) struct Effect {
-    pub(crate) eq_cache: Option<Box<dyn Any + Send + Sync>>,
-    pub(crate) f: EffectStage,
-}
-
-pub(crate) enum EffectStage {
-    Effect(Box<dyn FnOnce() -> Box<dyn FnOnce() + Send + Sync> + Send + Sync>),
-    Destructor(Box<dyn FnOnce() + Send + Sync>),
-}
-
 pub(crate) struct Component {
     f: Box<dyn DynComponentFunc>,
     props: Box<dyn Prop>,
-    state: Vec<Arc<dyn Any + Send + Sync>>,
-    memos: Vec<Option<Arc<Memo>>>,
-    effects: Vec<Effect>,
 }
 
 impl Component {
@@ -105,17 +81,9 @@ impl Component {
         dom: &mut Dom,
         parent: Option<PrimitiveId>,
     ) {
-        let new_children = self.f.call(
-            &*self.props,
-            Fctx::update(
-                ctx.tx.clone(),
-                id,
-                &mut self.state,
-                &mut self.memos,
-                &mut self.effects,
-                dom.world,
-            ),
-        );
+        let new_children = self
+            .f
+            .call(&*self.props, Fctx::update(ctx.tx.clone(), id, dom.world));
         ctx.diff_children(children, new_children, dom, parent);
     }
 }
@@ -156,7 +124,7 @@ impl Clone for Box<dyn Prop> {
 #[derive(Clone)]
 enum ElementInner {
     Component(ComponentTemplate),
-    Primitive(Primitive, Vec<Element>),
+    Primitive(PrimitiveData, Vec<Element>),
 }
 
 #[derive(Clone)]
@@ -255,11 +223,6 @@ impl Context {
         let mut flagged = HashSet::default();
         while !self.rx.is_empty() {
             for resolver in self.rx.clone().try_iter() {
-                let id = match resolver.resolve(world) {
-                    Some(id) if !flagged.contains(&id) => id,
-                    _ => continue,
-                };
-
                 fn recursive(
                     element: MountedId,
                     roots: &mut HashSet<MountedId>,
@@ -275,8 +238,25 @@ impl Context {
                     }
                 }
 
-                roots.insert(id);
-                recursive(id, &mut roots, &mut flagged, &world);
+                match resolver.resolve(world) {
+                    ResolveResult::Mounted(id) => {
+                        if flagged.contains(&id) {
+                            continue;
+                        }
+                        roots.insert(id);
+                        recursive(id, &mut roots, &mut flagged, &world);
+                    }
+                    ResolveResult::Resource(id) => {
+                        let ids = &*self.res_checks[&id].1;
+                        for id in ids.iter().copied() {
+                            if flagged.contains(&id) {
+                                continue;
+                            }
+                            roots.insert(id);
+                            recursive(id, &mut roots, &mut flagged, &world);
+                        }
+                    }
+                };
             }
             flagged.clear();
             for rerender_root in roots.drain() {
@@ -349,18 +329,12 @@ impl Context {
                 )
             }
             ElementInner::Component(c) => {
-                let mut state = Vec::new();
-                let mut memos = Vec::new();
-                let mut effects = Vec::new();
                 let entity = dom.world.spawn().id();
                 let children = c.f.call(
                     &*c.props,
                     Fctx::render_first(
                         self.tx.clone(),
                         MountedId(entity),
-                        &mut state,
-                        &mut memos,
-                        &mut effects,
                         &mut self.res_checks,
                         &mut self.cmp_checks,
                         dom.world,
@@ -381,22 +355,10 @@ impl Context {
                         unkeyed.push(mount_id);
                     }
                 }
-                for effect in effects.iter_mut() {
-                    replace_with::replace_with_or_abort(effect, |effect| match effect.f {
-                        EffectStage::Effect(e) => Effect {
-                            eq_cache: effect.eq_cache,
-                            f: EffectStage::Destructor(e()),
-                        },
-                        EffectStage::Destructor(_) => effect,
-                    });
-                }
 
                 let component = Component {
                     f: c.f,
                     props: c.props,
-                    state,
-                    memos,
-                    effects,
                 };
                 dom.world.entity_mut(entity).insert(Mounted {
                     inner: MountedInner::Component(component),
@@ -420,13 +382,7 @@ impl Context {
             MountedInner::Primitive(id) => {
                 dom.remove(id);
             }
-            MountedInner::Component(c) => {
-                for effect in c.effects.into_iter() {
-                    match effect.f {
-                        EffectStage::Destructor(d) => d(),
-                        _ => {}
-                    }
-                }
+            MountedInner::Component(_) => {
                 dom.world.despawn(this.0);
                 self.cmp_checks.remove(&this);
             }
@@ -700,14 +656,14 @@ impl From<Option<Element>> for ComponentOutput {
 }
 pub fn node(children: impl Into<Vec<Element>>) -> Element {
     Element(
-        ElementInner::Primitive(Primitive::Node, children.into()),
+        ElementInner::Primitive(PrimitiveData::Node, children.into()),
         None,
     )
 }
 
 pub fn text(text: impl Into<String>) -> Element {
     Element(
-        ElementInner::Primitive(Primitive::Text(text.into()), vec![]),
+        ElementInner::Primitive(PrimitiveData::Text(text.into()), vec![]),
         None,
     )
 }

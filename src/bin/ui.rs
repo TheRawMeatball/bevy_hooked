@@ -18,7 +18,7 @@ fn main() {
 }
 
 pub fn simple_blinker(ctx: Fctx, period: &f32) -> Element {
-    let is_on = ctx.use_linked_state(|| Blinker(false));
+    let (is_on, _) = ctx.use_linked_state(|| Blinker(false));
     ctx.use_disconnected_state(|| TimeSpent(0.));
     ctx.use_broadcast_state(Period(*period));
 
@@ -30,7 +30,7 @@ pub fn simple_blinker(ctx: Fctx, period: &f32) -> Element {
 }
 
 pub fn full_blinker(ctx: Fctx, period: &f32) -> Option<Element> {
-    let is_on = ctx.use_linked_state(|| Blinker(false));
+    let (is_on, _) = ctx.use_linked_state(|| Blinker(false));
     ctx.use_disconnected_state(|| TimeSpent(0.));
     ctx.use_broadcast_state(Period(*period));
 
@@ -52,7 +52,7 @@ fn blinker_system(mut q: Query<(&mut TimeSpent, &mut Blinker, &Period)>, dt: Res
 }
 
 pub fn counter(ctx: Fctx) -> Element {
-    let state = ctx.use_linked_state(|| IntegerTimeSpent(0));
+    let (state, _) = ctx.use_linked_state(|| IntegerTimeSpent(0));
     ctx.use_disconnected_state(|| TimeSpent(0.));
 
     e::text(format!("{} seconds since creation!", state.0))

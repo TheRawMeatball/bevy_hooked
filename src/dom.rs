@@ -11,11 +11,16 @@ use bevy::{
 use crate::FontHandle;
 
 #[derive(Clone, Debug)]
-pub enum Primitive {
+pub enum PrimitiveData {
     Node,
     Text(String),
     Image,
     Button,
+}
+
+#[derive(Clone, Debug)]
+pub struct Primitive {
+    data: PrimitiveData,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -29,7 +34,7 @@ pub struct Dom<'a> {
 impl<'a> Dom<'a> {
     pub fn mount_as_child(
         &mut self,
-        primitive: Primitive,
+        primitive: PrimitiveData,
         parent: Option<PrimitiveId>,
     ) -> PrimitiveId {
         let font = self.world.get_resource::<FontHandle>().unwrap().0.clone();
@@ -44,7 +49,7 @@ impl<'a> Dom<'a> {
         self.cursor += 1;
         PrimitiveId(id)
     }
-    pub fn diff_primitive(&mut self, old: PrimitiveId, new: Primitive) {
+    pub fn diff_primitive(&mut self, old: PrimitiveId, new: PrimitiveData) {
         let font = self.world.get_resource::<FontHandle>().unwrap().0.clone();
         let mut entity = self.world.entity_mut(old.0);
         let kind = entity.remove::<PrimitiveKind>().unwrap();
@@ -83,9 +88,9 @@ impl<'a> Dom<'a> {
     }
 }
 
-fn helper(entity: &mut EntityMut, primitive: Primitive, font: Handle<Font>) {
+fn helper(entity: &mut EntityMut, primitive: PrimitiveData, font: Handle<Font>) {
     let kind = match primitive {
-        Primitive::Node => {
+        PrimitiveData::Node => {
             entity.insert_bundle(NodeBundle {
                 style: Style {
                     flex_direction: FlexDirection::ColumnReverse,
@@ -96,7 +101,7 @@ fn helper(entity: &mut EntityMut, primitive: Primitive, font: Handle<Font>) {
             });
             PrimitiveKind::Node
         }
-        Primitive::Text(value) => {
+        PrimitiveData::Text(value) => {
             entity.insert_bundle(TextBundle {
                 text: Text::with_section(
                     value,
@@ -111,13 +116,13 @@ fn helper(entity: &mut EntityMut, primitive: Primitive, font: Handle<Font>) {
             });
             PrimitiveKind::Text
         }
-        Primitive::Image => {
+        PrimitiveData::Image => {
             entity.insert_bundle(ImageBundle {
                 ..Default::default()
             });
             PrimitiveKind::Image
         }
-        Primitive::Button => {
+        PrimitiveData::Button => {
             entity.insert_bundle(ButtonBundle {
                 ..Default::default()
             });

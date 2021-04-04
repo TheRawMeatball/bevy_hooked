@@ -19,7 +19,7 @@ pub mod prelude {
         pub use super::internal::{node, text};
     }
     pub use crate::HookedUiPlugin;
-    pub use dom::{Dom, Primitive, PrimitiveId, PrimitiveKind};
+    pub use dom::{Dom, PrimitiveData, PrimitiveId, PrimitiveKind};
 }
 
 pub struct HookedUiPlugin(pub fn() -> Element);
